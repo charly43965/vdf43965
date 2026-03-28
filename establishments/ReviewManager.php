@@ -1,7 +1,7 @@
 <?php
 
-require_once 'PocketBase.php';
-require_once 'PocketbaseHelpers.php';
+require_once __DIR__ . '/../core/PocketBase.php';
+require_once __DIR__ . '/../core/PocketBaseHelpers.php';
 
 class ReviewManager {
     use PocketBaseHelpers;
@@ -14,7 +14,7 @@ class ReviewManager {
     /** validateRating()
      * Validates that a rating is within the accepted 1–5 range.
      *
-     * @param int $rating The rating value to validate.
+     * @param int $rating The rating validate.
      * @return void
      * @throws InvalidArgumentException If $rating is not between 1 and 5.
      */

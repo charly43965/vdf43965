@@ -1,7 +1,7 @@
 <?php
 
-require_once 'PocketBase.php';
-require_once 'PocketBaseHelpers.php';
+require_once __DIR__ . '/PocketBase.php';
+require_once __DIR__ . '/PocketBaseHelpers.php';
 
 class UserManager {
     use PocketBaseHelpers;
@@ -141,32 +141,19 @@ class UserManager {
         return $response['body'];
     }
 
-    /** changePassword()
-     * Changes the password of a user.
+    /** updateAvatar()
+     * Updates the avatar of a user.
+     * 
+     * Uses a multipart upload since PocketBase stores files in an S3.
      *
      * @param string $id User's ID.
-     * @param string $oldPassword User's current password.
-     * @param string $newPassword Newpassword to set.
-     * @param string $passwordConfirm Must match $newPassword.
+     * @param string $filePath Absolute path to the image file to upload.
      * @return array Updated user.
-     * @throws InvalidArgumentException If $newPassword and $passwordConfirm do not match.
-     * @throws RuntimeException If the request fails.
+     * @throws InvalidArgumentException If the file does not exist.
+     * @throws RuntimeException If the upload request fails.
      */
-     public function changePassword(
-        string $id,
-        string $oldPassword,
-        string $newPassword,
-        string $passwordConfirm,
-     ): array {
-        if ($newPassword !== $passwordConfirm) throw new InvalidArgumentException("New password and confirmation do not match.");
-
-        $response = $this->pocketbase->sendRequest('PATCH', "/api/collections/users/records/$id", [
-            'oldPassword'     => $oldPassword,
-            'password'        => $newPassword,
-            'passwordConfirm' => $passwordConfirm,
-        ]);
-        $this->throwIfError($response);
-        return $response['body'];
+     public function updateAvatar(string $id, string $filePath): array {
+        return $this->uploadFile('users', $id, 'avatar', $filePath);
     }
 
     /** changeEmail()
@@ -197,6 +184,34 @@ class UserManager {
         return $response['body'];
     }
 
+    /** changePassword()
+     * Changes the password of a user.
+     *
+     * @param string $id User's ID.
+     * @param string $oldPassword User's current password.
+     * @param string $newPassword Newpassword to set.
+     * @param string $passwordConfirm Must match $newPassword.
+     * @return array Updated user.
+     * @throws InvalidArgumentException If $newPassword and $passwordConfirm do not match.
+     * @throws RuntimeException If the request fails.
+     */
+     public function changePassword(
+        string $id,
+        string $oldPassword,
+        string $newPassword,
+        string $passwordConfirm,
+     ): array {
+        if ($newPassword !== $passwordConfirm) throw new InvalidArgumentException("New password and confirmation do not match.");
+
+        $response = $this->pocketbase->sendRequest('PATCH', "/api/collections/users/records/$id", [
+            'oldPassword'     => $oldPassword,
+            'password'        => $newPassword,
+            'passwordConfirm' => $passwordConfirm,
+        ]);
+        $this->throwIfError($response);
+        return $response['body'];
+    }
+
     /** changePhoneNumber()
      * Changes the phone number of a user.
      *
@@ -223,21 +238,6 @@ class UserManager {
         $response = $this->pocketbase->sendRequest('PATCH', "/api/collections/users/records/$id", ['phone_number' => $newPhoneNumber]);
         $this->throwIfError($response);
         return $response['body'];
-    }
-
-    /** updateAvatar()
-     * Updates the avatar of a user.
-     * 
-     * Uses a multipart upload since PocketBase stores files in an S3.
-     *
-     * @param string $id User's ID.
-     * @param string $filePath Absolute path to the image file to upload.
-     * @return array Updated user.
-     * @throws InvalidArgumentException If the file does not exist.
-     * @throws RuntimeException If the upload request fails.
-     */
-     public function updateAvatar(string $id, string $filePath): array {
-        return $this->uploadFile('users', $id, 'avatar', $filePath);
     }
 
     //==============
@@ -291,8 +291,52 @@ class UserManager {
     }
 
     //==============
-    // Ban / Timeout / Unban
+    // Punishments
     //==============
+    /** warn()
+     * Issues a warning to a user.
+     * 
+     * Warnings decay after 6 months and are not counted toward thresholds after that.
+     * 
+     * - At 1 active warning: the user is automatically timed out for 1 day.
+     * 
+     * - At 2 active warnings: the user is automatically timed out for 3 days.
+     * 
+     * - At 3 active warnings: the user is automatically permanently banned.
+     *
+     * @param string $userId User's ID.
+     * @return array An array with the 'warning' and the associated automated 'action' (null | 'timeout' | 'ban').
+     * @throws RuntimeException If any request fails.
+     */
+     public function warn(string $userId): array {
+        $response = $this->pocketbase->sendRequest('POST', '/api/collections/warnings/records', [
+            'user_id'    => $userId,
+            'created_at' => (new DateTimeImmutable("now", new DateTimeZone('UTC')))->format('Y-m-d H:i:s.000') . 'Z',
+        ]);
+
+        $this->throwIfError($response);
+        $warning = $response['body'];
+        $action = null;
+        $decayedWarnings = (new DateTimeImmutable("now", new DateTimeZone('UTC')))->modify('-6 months')->format('Y-m-d H:i:s.000') . 'Z';
+        $filter = urlencode("user_id='$userId' && created_at>='$decayedWarnings'");
+        $response = $this->pocketbase->sendRequest('GET', "/api/collections/warnings/records?filter=($filter)&perPage=500");
+        $this->throwIfError($response);
+        $activeWarnings = $response['body']['totalItems'];
+
+        if ($activeWarnings === 3) {
+            $this->ban($userId);
+            $action = 'ban';
+        } elseif ($activeWarnings > 0) {
+            $this->timeout($userId, $activeWarnings === 2 ? 3 : 1);
+            $action = 'timeout';
+        }
+
+        return [
+            'warning' => $warning,
+            'action'  => $action,
+        ];
+    }
+
     /** timeout()
      * Temporarily bans a user for a given number of days.
      * 
@@ -309,7 +353,6 @@ class UserManager {
      public function timeout(string $id, int $days): array {
         if ($days <= 0) throw new InvalidArgumentException("Timeout duration must be at least 1 day.");
 
-        // Datetime object representing the current time set to UTC.
         $bannedUntil = (new DateTimeImmutable("now", new DateTimeZone('UTC')))
         // Creates a new Datetime object with the days added to original value.
         // DateTimeImmutable never mutates; modify() always produces a new object, leaving the original untouched.
@@ -323,6 +366,7 @@ class UserManager {
             'is_banned'    => false,
             'banned_until' => $bannedUntil,
         ]);
+
         $this->throwIfError($response);
         return $response['body'];
     }
@@ -343,6 +387,7 @@ class UserManager {
             'is_banned'    => true,
             'banned_until' => null,
         ]);
+
         $this->throwIfError($response);
         return $response['body'];
     }
@@ -361,6 +406,7 @@ class UserManager {
             'is_banned'    => false,
             'banned_until' => null,
         ]);
+
         $this->throwIfError($response);
         return $response['body'];
     }
@@ -402,6 +448,7 @@ class UserManager {
             'verified'        => false,
             'avatar'          => null,
         ]);
+        
         $this->throwIfError($response);
         return $response['body'];
     }
